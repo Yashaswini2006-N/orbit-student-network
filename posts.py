@@ -226,20 +226,13 @@ def trending_posts(posts, username, network):
         if post["username"] in connections
     ]
 
-    def engagement_score(post):
-
-        likes = len(post["likes"])
-        comments = count_comments(post["comments"])
-
-        return likes + comments
-
     return sorted(
         trending,
         key=lambda post: (
-            engagement_score(post),
-            post["created_at"]
+            len(post["likes"]),
+            post["created_at"],
         ),
-        reverse=True
+        reverse=True,
     )
 
 

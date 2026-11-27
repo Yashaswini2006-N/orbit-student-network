@@ -123,48 +123,72 @@ def test_newest_first_ordering_distinct_timestamps():
     )
 
 
-def test_trending_posts_ranking_and_zero_engagement():
+def test_trending_posts_uses_likes_only_and_newest_tiebreak():
     network = make_sample_network()
     posts_list = []
     notifications = {}
 
-    # Post 1: accepted connection, engagement = 1
-    posts.create_post(posts_list, "Rachana C Madure", "Low engagement post")
+    # The first two accepted posts have equal likes; the newer one should lead.
+    posts.create_post(posts_list, "Rachana C Madure", "Older two-like post")
     time.sleep(0.02)
-    # Post 2: accepted connection, engagement = 0
-    posts.create_post(posts_list, "Anshuman Roy", "Zero engagement post")
+    posts.create_post(posts_list, "Anshuman Roy", "Newer two-like post")
     time.sleep(0.02)
-    # Post 3: accepted connection, engagement = 4 (1 like + 1 comment + 2 nested replies)
-    posts.create_post(posts_list, "Rachana C Madure", "High engagement post")
+    # Many comments must not lift this one-like post above posts with two likes.
+    posts.create_post(posts_list, "Rachana C Madure", "Comment-heavy one-like post")
     time.sleep(0.02)
-    # Post 4: non-connection (stranger to Yashaswini), engagement = 3 (must be excluded)
-    posts.create_post(posts_list, "Jeevan Yogesh Ghandasi", "Stranger popular post")
+    posts.create_post(posts_list, "Anshuman Roy", "Zero-like post")
+    time.sleep(0.02)
+    posts.create_post(posts_list, "Jeevan Yogesh Ghandasi", "Popular stranger post")
 
-    # Engagement on Post 1 (score = 1)
     assert posts.like_post(posts_list, 1, "Yashaswini N", notifications) == "Post liked."
-
-    # Engagement on Post 3 (score = 4)
+    assert posts.like_post(posts_list, 1, "Anshuman Roy", notifications) == "Post liked."
+    assert posts.like_post(posts_list, 2, "Yashaswini N", notifications) == "Post liked."
+    assert posts.like_post(posts_list, 2, "Rachana C Madure", notifications) == "Post liked."
     assert posts.like_post(posts_list, 3, "Yashaswini N", notifications) == "Post liked."
-    assert posts.add_comment(posts_list, 3, "Yashaswini N", "Nice!", notifications) == "Comment added."
+    assert posts.add_comment(posts_list, 3, "Yashaswini N", "First comment", notifications) == "Comment added."
     assert posts.add_comment(
-        posts_list, 3, "Rachana C Madure", "Thanks!", notifications, parent_comment_id=1
+        posts_list, 3, "Rachana C Madure", "Reply one", notifications, parent_comment_id=1
     ) == "Reply added."
     assert posts.add_comment(
-        posts_list, 3, "Yashaswini N", "Welcome!", notifications, parent_comment_id=2
+        posts_list, 3, "Yashaswini N", "Reply two", notifications, parent_comment_id=2
     ) == "Reply added."
+    # An excluded stranger may have more likes and comments than every connection post.
+    posts_list[4]["likes"] = [f"user{i}" for i in range(10)]
+    posts_list[4]["comments"] = [{"replies": []} for _ in range(10)]
 
-    # Engagement on Post 4 (stranger, score = 3)
-    assert posts.like_post(posts_list, 4, "Rachana C Madure", notifications) == "Post liked."
-    assert posts.like_post(posts_list, 4, "Giridhar N", notifications) == "Post liked."
-    assert posts.add_comment(posts_list, 4, "Rachana C Madure", "Cool!", notifications) == "Comment added."
-
-    trending = posts.trending_posts(posts_list, "Yashaswini N", network)
-    ranked_ids = [post["post_id"] for post in trending]
-
-    assert ranked_ids == [3, 1, 2], (
-        f"Expected trending order [3 (score 4), 1 (score 1), 2 (score 0)], got {ranked_ids}"
+    ranked_ids = [post["post_id"] for post in posts.trending_posts(posts_list, "Yashaswini N", network)]
+    assert ranked_ids == [2, 1, 3, 4], (
+        f"Expected likes-only order with newest tie-break [2, 1, 3, 4], got {ranked_ids}"
     )
-    assert 4 not in ranked_ids, "Non-connection posts must not appear in trending_posts"
+
+    assert posts.trending_posts([], "Yashaswini N", network) == []
+    assert posts.trending_posts(posts_list, "Unknown User", network) == []
+
+
+def test_trending_updates_after_like_and_home_feed_stays_newest_first():
+    network = make_sample_network()
+    posts_list = []
+    notifications = {}
+
+    posts.create_post(posts_list, "Rachana C Madure", "Older post")
+    time.sleep(0.02)
+    posts.create_post(posts_list, "Anshuman Roy", "Newer post")
+
+    assert posts.like_post(posts_list, 1, "Yashaswini N", notifications) == "Post liked."
+    assert posts.like_post(posts_list, 1, "Anshuman Roy", notifications) == "Post liked."
+    assert posts.like_post(posts_list, 2, "Rachana C Madure", notifications) == "Post liked."
+
+    before = [post["post_id"] for post in posts.trending_posts(posts_list, "Yashaswini N", network)]
+    feed_before = [post["post_id"] for post in posts.home_feed(posts_list, "Yashaswini N", network)]
+    assert before == [1, 2]
+    assert feed_before == [2, 1], "The regular feed should remain newest-first"
+
+    assert posts.like_post(posts_list, 2, "Yashaswini N", notifications) == "Post liked."
+    after = [post["post_id"] for post in posts.trending_posts(posts_list, "Yashaswini N", network)]
+    feed_after = [post["post_id"] for post in posts.home_feed(posts_list, "Yashaswini N", network)]
+
+    assert after == [2, 1], f"Expected the newly liked, newer post to rank first, got {after}"
+    assert feed_after == feed_before == [2, 1], "Liking should not change regular feed ordering"
 
 
 def test_delete_post_ownership_and_invalid_id():
@@ -307,7 +331,8 @@ def run_all_tests():
         test_reject_empty_posts,
         test_home_feed_filtering_and_pending_exclusion,
         test_newest_first_ordering_distinct_timestamps,
-        test_trending_posts_ranking_and_zero_engagement,
+        test_trending_posts_uses_likes_only_and_newest_tiebreak,
+        test_trending_updates_after_like_and_home_feed_stays_newest_first,
         test_delete_post_ownership_and_invalid_id,
         test_likes_duplicates_unlike_and_invalid_post,
         test_comments_validation_and_nested_replies,

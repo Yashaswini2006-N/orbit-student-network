@@ -2,6 +2,7 @@ import tempfile
 from pathlib import Path
 
 import accounts
+import main
 import network
 import notifications as notif_mod
 import posts
@@ -164,8 +165,132 @@ def test_end_to_end_backend_workflow():
             storage.DATA_FOLDER = original_folder
 
 
+def test_connection_state_refreshes_between_two_sessions_in_both_directions():
+    """Check that sessions reload request JSON and expose incoming/outgoing requests."""
+    original_folder = storage.DATA_FOLDER
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        storage.DATA_FOLDER = Path(tmp_dir) / "data"
+        try:
+            graph = network.initialise_network(["Alice", "Bob"])
+            storage.save_data("connections.json", graph)
+            alice_session = {"connections": network.initialise_network(["Alice", "Bob"])}
+            bob_session = {"connections": network.initialise_network(["Alice", "Bob"])}
+
+            # Alice sends; Bob's stale session refreshes and sees the incoming request.
+            assert network.send_request(graph, "Alice", "Bob") == "Connection request sent."
+            storage.save_data("connections.json", graph)
+            main._refresh_connection_state(bob_session)
+            incoming_senders = {
+                request["sender"] for request in bob_session["connections"]["pending"]
+                if request["receiver"] == "Bob"
+            }
+            outgoing_receivers = {
+                request["receiver"] for request in bob_session["connections"]["pending"]
+                if request["sender"] == "Alice"
+            }
+            assert "Alice" in incoming_senders
+            assert "Bob" in outgoing_receivers
+            assert network.send_request(bob_session["connections"], "Bob", "Alice") == (
+                "This user has already sent you a request."
+            )
+
+            # Bob accepts; Alice's session reloads mutual accepted state from JSON.
+            assert network.accept_request(bob_session["connections"], "Alice", "Bob") == "Connection accepted."
+            storage.save_data("connections.json", bob_session["connections"])
+            main._refresh_connection_state(alice_session)
+            assert "Bob" in alice_session["connections"]["accepted"]["Alice"]
+            assert "Alice" in alice_session["connections"]["accepted"]["Bob"]
+            assert alice_session["connections"]["pending"] == []
+
+            # Repeat with Bob sending and Alice accepting.
+            reverse_graph = network.initialise_network(["Alice", "Bob"])
+            storage.save_data("connections.json", reverse_graph)
+            alice_session["connections"] = network.initialise_network(["Alice", "Bob"])
+            bob_session["connections"] = network.initialise_network(["Alice", "Bob"])
+            assert network.send_request(reverse_graph, "Bob", "Alice") == "Connection request sent."
+            storage.save_data("connections.json", reverse_graph)
+            main._refresh_connection_state(alice_session)
+            main._refresh_connection_state(bob_session)
+            incoming_senders = {
+                request["sender"] for request in alice_session["connections"]["pending"]
+                if request["receiver"] == "Alice"
+            }
+            outgoing_receivers = {
+                request["receiver"] for request in bob_session["connections"]["pending"]
+                if request["sender"] == "Bob"
+            }
+            assert "Bob" in incoming_senders
+            assert "Alice" in outgoing_receivers
+            assert network.send_request(bob_session["connections"], "Bob", "Alice") == "Request already sent."
+
+            assert network.accept_request(alice_session["connections"], "Bob", "Alice") == "Connection accepted."
+            storage.save_data("connections.json", alice_session["connections"])
+            main._refresh_connection_state(bob_session)
+            assert "Alice" in bob_session["connections"]["accepted"]["Bob"]
+            assert "Bob" in bob_session["connections"]["accepted"]["Alice"]
+            assert bob_session["connections"]["pending"] == []
+        finally:
+            storage.DATA_FOLDER = original_folder
+
+
+def test_notifications_refresh_between_sessions_and_mark_read():
+    """Verify request/accept notifications and unread counts refresh from JSON."""
+    original_folder = storage.DATA_FOLDER
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        storage.DATA_FOLDER = Path(tmp_dir) / "data"
+        try:
+            storage.save_data("notifications.json", {})
+            sender_session = {"notifications": {}}
+            recipient_session = {"notifications": {}}
+
+            request_notifications = storage.load_data("notifications.json")
+            notif_mod.notify_connection_request(request_notifications, "Alice", "Bob")
+            storage.save_data("notifications.json", request_notifications)
+
+            main._refresh_notification_state(recipient_session)
+            assert notif_mod.unread_count(recipient_session["notifications"], "Bob") == 1
+            assert notif_mod.view_notifications(recipient_session["notifications"], "Bob")[0]["message"] == (
+                "Alice sent you a connection request."
+            )
+
+            notif_mod.mark_notifications_read(recipient_session["notifications"], "Bob")
+            storage.save_data("notifications.json", recipient_session["notifications"])
+            main._refresh_notification_state(sender_session)
+            assert notif_mod.unread_count(sender_session["notifications"], "Bob") == 0
+
+            accepted_notifications = storage.load_data("notifications.json")
+            notif_mod.notify_connection_accepted(accepted_notifications, "Alice", "Bob")
+            storage.save_data("notifications.json", accepted_notifications)
+            main._refresh_notification_state(sender_session)
+            assert notif_mod.unread_count(sender_session["notifications"], "Alice") == 1
+            assert notif_mod.view_notifications(sender_session["notifications"], "Alice")[0]["message"] == (
+                "Bob accepted your connection request."
+            )
+        finally:
+            storage.DATA_FOLDER = original_folder
+
+
+def test_navigation_page_restores_from_validated_query_parameter():
+    """Persist the selected page without treating a URL value as authentication."""
+    valid_pages = {"Home", "Trending", "Connections", "Profile", "Notifications"}
+    session_state = {}
+    main._restore_navigation_page(session_state, {"page": "Profile"}, valid_pages)
+    assert session_state["sidebar_navigation"] == "Profile"
+
+    session_state = {}
+    main._restore_navigation_page(session_state, {"page": "admin"}, valid_pages)
+    assert session_state["sidebar_navigation"] == "Home"
+
+
 def run_all_tests():
-    tests = [test_end_to_end_backend_workflow]
+    tests = [
+        test_end_to_end_backend_workflow,
+        test_connection_state_refreshes_between_two_sessions_in_both_directions,
+        test_notifications_refresh_between_sessions_and_mark_read,
+        test_navigation_page_restores_from_validated_query_parameter,
+    ]
     passed = 0
     failed = 0
 

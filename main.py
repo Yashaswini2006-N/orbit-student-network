@@ -194,8 +194,27 @@ def _cleanup_unused_image(image_path):
 
 
 
+def _refresh_connection_state(session_state):
+    """Reload the shared connection graph so sessions see other users' requests."""
+    session_state["connections"] = storage.load_data("connections.json")
+
+
+def _refresh_notification_state(session_state):
+    """Reload notifications so separate sessions see new events and read changes."""
+    session_state["notifications"] = storage.load_data("notifications.json")
+
+
+def _restore_navigation_page(session_state, query_params, valid_pages):
+    """Restore only a validated page name; authentication still gates all content."""
+    if session_state.get("sidebar_navigation") not in valid_pages:
+        requested_page = query_params.get("page", "Home")
+        session_state["sidebar_navigation"] = (
+            requested_page if requested_page in valid_pages else "Home"
+        )
+
+
 def init_session_state():
-    """Load application data once per Streamlit session and initialize state keys."""
+    """Load app data once, then refresh shared connections and notifications on reruns."""
     if "data_loaded" not in st.session_state:
         try:
             students, connections, posts_list, notifs = storage.load_all_data()
@@ -208,6 +227,13 @@ def init_session_state():
         st.session_state["posts"] = posts_list
         st.session_state["notifications"] = notifs
         st.session_state["data_loaded"] = True
+    else:
+        try:
+            _refresh_connection_state(st.session_state)
+            _refresh_notification_state(st.session_state)
+        except ValueError as err:
+            st.error(f"Unable to refresh shared app data: {err}")
+            st.stop()
 
     if "logged_in_user" not in st.session_state:
         st.session_state["logged_in_user"] = None
@@ -594,8 +620,15 @@ def _accept_connection_request_action(sender, current_user):
         st.warning(msg)
 
 
+@st.fragment(run_every="2s")
 def render_connections_page(current_user):
-    """Render directory, requests, accepted connections, Jaccard suggestions, and BFS finder."""
+    """Refresh shared connections while this page is open, then render the page."""
+    try:
+        _refresh_connection_state(st.session_state)
+    except ValueError as err:
+        st.error(f"Unable to load connection data: {err}")
+        st.stop()
+
     st.subheader("Connections")
 
     students = st.session_state["students"]
@@ -836,8 +869,31 @@ def render_trending_page(current_user):
         render_post_card(post, current_user, key_prefix="trending")
 
 
+@st.fragment(run_every="3s")
+def render_notification_badge(current_user):
+    """Refresh and render the unread badge without rerunning the full app."""
+    try:
+        _refresh_notification_state(st.session_state)
+    except ValueError as err:
+        st.error(f"Unable to load notification data: {err}")
+        return
+
+    unread = notifications.unread_count(st.session_state["notifications"], current_user)
+    st.markdown(
+        f'<div class="orbit-unread"><span>Unread notifications</span><span class="orbit-unread-count">{unread}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+
+@st.fragment(run_every="3s")
 def render_notifications_page(current_user):
-    """Render user notifications, read/unread status, and Mark All as Read."""
+    """Refresh and render user notifications and read/unread status."""
+    try:
+        _refresh_notification_state(st.session_state)
+    except ValueError as err:
+        st.error(f"Unable to load notification data: {err}")
+        return
+
     st.subheader("Notifications")
     notifs = st.session_state["notifications"]
     items = notifications.view_notifications(notifs, current_user)
@@ -849,6 +905,12 @@ def render_notifications_page(current_user):
     with c_btn:
         if unread > 0:
             if st.button("Mark All as Read", key="mark_all_read_btn"):
+                try:
+                    _refresh_notification_state(st.session_state)
+                except ValueError as err:
+                    st.error(f"Unable to load notification data: {err}")
+                    return
+                notifs = st.session_state["notifications"]
                 msg = notifications.mark_notifications_read(notifs, current_user)
                 storage.save_data("notifications.json", notifs)
                 st.session_state["flash_message"] = ("success", msg)
@@ -964,12 +1026,6 @@ def render_logged_in_app(current_user):
     st.sidebar.markdown('<div class="orbit-sidebar-tagline">Your campus. Your connections.</div>', unsafe_allow_html=True)
     st.sidebar.markdown(f"**Signed in as:** {display_name}")
 
-    unread = notifications.unread_count(st.session_state["notifications"], current_user)
-    st.sidebar.markdown(
-        f'<div class="orbit-unread"><span>Unread notifications</span><span class="orbit-unread-count">{unread}</span></div>',
-        unsafe_allow_html=True,
-    )
-
     nav_items = [
         ("Home", "home"),
         ("Trending", "trending"),
@@ -977,8 +1033,11 @@ def render_logged_in_app(current_user):
         ("Profile", "profile"),
         ("Notifications", "notifications"),
     ]
-    if st.session_state.get("sidebar_navigation") not in {item[0] for item in nav_items}:
-        st.session_state["sidebar_navigation"] = "Home"
+    valid_pages = {item[0] for item in nav_items}
+    _restore_navigation_page(st.session_state, st.query_params, valid_pages)
+
+    with st.sidebar:
+        render_notification_badge(current_user)
 
     for page_name, key_suffix in nav_items:
         if st.sidebar.button(
@@ -988,6 +1047,7 @@ def render_logged_in_app(current_user):
             use_container_width=True,
         ):
             st.session_state["sidebar_navigation"] = page_name
+            st.query_params["page"] = page_name
             st.rerun()
 
     page = st.session_state["sidebar_navigation"]
@@ -995,6 +1055,8 @@ def render_logged_in_app(current_user):
     if st.sidebar.button("Logout", key="logout_button", use_container_width=True):
         ok, msg = accounts.logout_student(st.session_state)
         if ok:
+            st.session_state["sidebar_navigation"] = "Home"
+            st.query_params["page"] = "Home"
             st.session_state["flash_message"] = ("success", msg)
             st.rerun()
         else:
